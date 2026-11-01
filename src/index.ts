@@ -1,4 +1,5 @@
-import { isAuthorized } from "./auth/basic.js";
+import { credentialsMatch, isAuthorized } from "./auth/basic.js";
+import { clearedSessionCookie, createSessionToken, readSessionCookie, sessionCookie, verifySessionToken } from "./auth/session.js";
 import { parseDavPath } from "./http/path.js";
 import { LimitedR2 } from "./monitor/limited-r2.js";
 import { QuotaExceededError } from "./monitor/quota.js";
@@ -8,6 +9,7 @@ import { verifyManagedSharePath, verifySharePath } from "./share/link.js";
 import { handleWebDav } from "./webdav/handler.js";
 import { apiFiles } from "./web/api.js";
 import { webPage } from "./web/page.js";
+import { loginPage } from "./web/login.js";
 import { apiRevokeShare, apiShare, apiShares } from "./web/share-api.js";
 import { apiTrash } from "./web/trash-api.js";
 import { purgeExpiredTrash } from "./storage/trash.js";
@@ -19,14 +21,91 @@ import { apiMap } from "./web/map-api.js";
 
 export { UsageStore };
 
-function unauthorized(): Response {
+function redirect(location: string, headers: HeadersInit = {}): Response {
+  const response = new Response(null, { status: 303, headers: { location, "cache-control": "no-store" } });
+  for (const [name, value] of new Headers(headers)) response.headers.append(name, value);
+  return response;
+}
+
+// Browsers send Sec-Fetch-* headers; WebDAV clients and scripts do not. Browser requests never get
+// a Basic Auth challenge, so the native password prompt is replaced by the login page.
+function unauthorized(request: Request): Response {
+  const fromBrowser = request.headers.has("sec-fetch-site") || request.headers.has("x-cfwd-ui");
+  if (fromBrowser && request.headers.get("sec-fetch-mode") === "navigate") return redirect("/login");
   return new Response("Authentication required.", {
     status: 401,
     headers: {
-      "www-authenticate": 'Basic realm="CF Free WebDAV", charset="UTF-8"',
+      ...(fromBrowser ? {} : { "www-authenticate": 'Basic realm="CF Free WebDAV", charset="UTF-8"' }),
       "content-type": "text/plain; charset=utf-8",
       "cache-control": "no-store",
     },
+  });
+}
+
+function htmlHeaders(nonce: string): Headers {
+  return new Headers({
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "private, no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "same-origin",
+    "content-security-policy": "default-src 'none'; style-src 'nonce-" + nonce + "'; script-src 'nonce-" + nonce + "'; connect-src 'self'; img-src 'self' data:; media-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  });
+}
+
+function newNonce(): string {
+  return btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(18))));
+}
+
+function expectedUsername(env: Env): string {
+  return env.WEBDAV_USERNAME || "webdav";
+}
+
+async function hasSession(request: Request, env: Env): Promise<boolean> {
+  const token = readSessionCookie(request);
+  return Boolean(token) && await verifySessionToken(token!, expectedUsername(env), env.WEBDAV_PASSWORD || "");
+}
+
+// The management page and its APIs accept the session cookie; scripts and WebDAV clients use Basic Auth.
+async function isAuthenticated(request: Request, env: Env): Promise<boolean> {
+  return await isAuthorized(request, expectedUsername(env), env.WEBDAV_PASSWORD || "") || await hasSession(request, env);
+}
+
+function crossSiteDenied(): Response {
+  return new Response("Cross-site requests are not allowed.", {
+    status: 403,
+    headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+const MAX_LOGIN_BODY_BYTES = 4096;
+
+async function handleLogin(request: Request, env: Env): Promise<Response> {
+  if (!hasCredentials(env)) return credentialError("Set the WEBDAV_PASSWORD secret before using WebDAV.");
+  const origin = new URL(request.url).origin;
+  if (request.method === "GET") {
+    if (await hasSession(request, env)) return redirect("/");
+    const nonce = newNonce();
+    return new Response(loginPage(nonce, { origin }), { headers: htmlHeaders(nonce) });
+  }
+  if (request.method !== "POST") return new Response("Method not allowed.", { status: 405, headers: { allow: "GET, POST" } });
+  if (isCrossSiteWrite(request)) return crossSiteDenied();
+
+  const length = Number(request.headers.get("content-length"));
+  const contentType = request.headers.get("content-type") || "";
+  if (!/^application\/x-www-form-urlencoded\b/i.test(contentType) || !Number.isSafeInteger(length) || length > MAX_LOGIN_BODY_BYTES) {
+    return new Response("Invalid login request.", { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } });
+  }
+  const form = new URLSearchParams(await request.text());
+  const username = form.get("username") || "";
+  const password = form.get("password") || "";
+  if (await credentialsMatch(username, password, expectedUsername(env), env.WEBDAV_PASSWORD || "")) {
+    const token = await createSessionToken(expectedUsername(env), env.WEBDAV_PASSWORD || "");
+    return redirect("/", { "set-cookie": sessionCookie(token) });
+  }
+  const nonce = newNonce();
+  return new Response(loginPage(nonce, { origin, username: username.slice(0, 256), error: "用户名或密码不正确" }), {
+    status: 401,
+    headers: htmlHeaders(nonce),
   });
 }
 
@@ -59,16 +138,9 @@ async function requireAuthorization(
   request: Request,
   env: Env,
 ): Promise<Response | null> {
-  if (isCrossSiteWrite(request)) {
-    return new Response("Cross-site requests are not allowed.", {
-      status: 403,
-      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
-    });
-  }
+  if (isCrossSiteWrite(request)) return crossSiteDenied();
   if (!hasCredentials(env)) return credentialError("Set the WEBDAV_PASSWORD secret before using WebDAV.");
-  if (!(await isAuthorized(request, env.WEBDAV_USERNAME || "webdav", env.WEBDAV_PASSWORD || ""))) {
-    return unauthorized();
-  }
+  if (!(await isAuthenticated(request, env))) return unauthorized(request);
   return null;
 }
 
@@ -134,19 +206,16 @@ export default {
       if (!hasCredentials(env)) {
         return credentialError("Set the WEBDAV_PASSWORD secret before using WebDAV.");
       }
-      if (!(await isAuthorized(request, env.WEBDAV_USERNAME || "webdav", env.WEBDAV_PASSWORD || ""))) {
-        return unauthorized();
-      }
-      const nonceBytes = crypto.getRandomValues(new Uint8Array(18));
-      const nonce = btoa(String.fromCharCode(...nonceBytes));
-      const headers = new Headers({
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "private, no-store",
-        "x-content-type-options": "nosniff",
-        "referrer-policy": "same-origin",
-        "content-security-policy": "default-src 'none'; style-src 'nonce-" + nonce + "'; script-src 'nonce-" + nonce + "'; connect-src 'self'; img-src 'self' data:; media-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
-      });
-      return new Response(webPage(nonce), { headers });
+      // The page itself requires a session, so a browser's cached Basic Auth cannot bypass logout.
+      if (!(await hasSession(request, env))) return redirect("/login");
+      const nonce = newNonce();
+      return new Response(webPage(nonce), { headers: htmlHeaders(nonce) });
+    }
+    if (url.pathname === "/login") return handleLogin(request, env);
+    if (url.pathname === "/logout") {
+      if (request.method !== "POST") return new Response("Method not allowed.", { status: 405, headers: { allow: "POST" } });
+      if (isCrossSiteWrite(request)) return crossSiteDenied();
+      return redirect("/login", { "set-cookie": clearedSessionCookie() });
     }
     if (url.pathname === "/api/files" && request.method === "GET") {
       const denied = await requireAuthorization(request, env);
@@ -301,8 +370,8 @@ export default {
       return credentialError("Set the WEBDAV_PASSWORD secret before using WebDAV.");
     }
 
-    const username = env.WEBDAV_USERNAME || "webdav";
-    if (!(await isAuthorized(request, username, env.WEBDAV_PASSWORD || ""))) return unauthorized();
+    if (isCrossSiteWrite(request)) return crossSiteDenied();
+    if (!(await isAuthenticated(request, env))) return unauthorized(request);
     if (!env.FILES || !env.USAGE_STORE) {
       return new Response("R2 bucket or Durable Object binding is not configured.", { status: 503 });
     }

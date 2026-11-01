@@ -9,6 +9,15 @@ async function constantTimeEqual(left: string, right: string): Promise<boolean> 
   return difference === 0;
 }
 
+export async function credentialsMatch(
+  username: string,
+  password: string,
+  expectedUsername: string,
+  expectedPassword: string,
+): Promise<boolean> {
+  return constantTimeEqual(`${username}:${password}`, `${expectedUsername}:${expectedPassword}`);
+}
+
 export async function isAuthorized(
   request: Request,
   expectedUsername: string,

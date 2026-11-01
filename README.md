@@ -101,9 +101,11 @@ npx wrangler secret put FEISHU_WEBHOOK_SECRET # Optional; required only if the b
 
 ## Web management page
 
-Open the Worker root URL and sign in with your WebDAV username and password to browse directories, create folders, rename, download, upload, and delete files. The page supports recursive search, sorting, multi-select actions, and previews for images, audio, video, and plain text files smaller than 1 MiB. It shows R2 storage and Class A/B operation allowances, current usage, and progress bars. The "Sync official usage" button triggers an immediate official usage reconciliation. Uploads show live progress, and you can drag files onto the file list to upload them.
+Open the Worker root URL to reach the sign-in page, then sign in with your WebDAV username and password to browse directories, create folders, rename, download, upload, and delete files. The page supports recursive search, sorting, multi-select actions, and previews for images, audio, video, and plain text files smaller than 1 MiB. It shows R2 storage and Class A/B operation allowances, current usage, and progress bars. The "Sync official usage" button triggers an immediate official usage reconciliation. Uploads show live progress, and you can drag files onto the file list to upload them.
 
-The page calls `/api/files` for directory listings and usage state and reuses the same Basic Auth session. Storage progress follows the configured `QUOTA_STORAGE_MAX_BYTES`; official reconciliation affects the displayed usage.
+Signing in sets an HttpOnly session cookie that lasts 7 days; the "退出" (sign out) button clears it. Changing `WEBDAV_PASSWORD` or `WEBDAV_USERNAME` invalidates every session. WebDAV clients and scripts keep using Basic Auth. The page follows the system light or dark theme.
+
+The page calls `/api/files` for directory listings and usage state. Storage progress follows the configured `QUOTA_STORAGE_MAX_BYTES`; official reconciliation affects the displayed usage.
 
 ### Trash and file versions
 
